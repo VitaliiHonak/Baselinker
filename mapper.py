@@ -1,10 +1,20 @@
 """
 Maps a Baselinker order dict to an OrderService POST body.
 
-Many OrderService fields are business-specific (seller_id, merchant_id,
-distribution_id, SLA IDs, city MDM IDs, etc.) and have no equivalent in
-Baselinker.  Pass a MappingConfig to supply those fixed values and any
-lookup tables you maintain externally.
+The expected payload structure is:
+{
+    "orders": {
+        "<seller_id>_<bl_order_id>": {
+            "orders":               {"fields": {...}},
+            "orders_deliveries":    {"fields": {...}},
+            "orders_merchandises":  [{"record_type": "0", "fields": {...}}, ...],
+            "additional_fields":    [{"fields": {"field_id": ..., "field_value": ...}}, ...]
+        }
+    }
+}
+
+Business-specific IDs (seller_id, merchant_id, etc.) have no equivalent in
+Baselinker — supply them via MappingConfig.
 """
 
 from __future__ import annotations
@@ -19,23 +29,22 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MappingConfig:
     # --- required business identifiers ----------------------------------------
-    user_id: int                  # OrderService user_id (buyer account in your system)
-    seller_id: int                # OrderService seller_id
-    merchant_id: int              # OrderService merchant_id
-    distribution_id: int          # OrderService distribution_id
-    payment_method_id: int        # OrderService payment_method_id
-    payment_method_type: str      # e.g. "card", "cash", "cod"
-    default_sla_id: int           # SLA applied to every merchandise line
-    default_delivery_service_mdm_id: str   # MDM ID from LocationService
+    user_id: int
+    seller_id: int
+    merchant_id: int
+    distribution_id: int
+    payment_method_id: int
+    payment_method_type: str        # e.g. "card", "cash"
+    default_delivery_service_mdm_id: str
     default_delivery_service_id: int
     default_delivery_method_id: int
-    default_city_id: int          # fallback when city cannot be resolved
-    default_city_mdm_id: str      # fallback MDM city ID
+    default_city_id: int
+    default_city_mdm_id: str
     checkout_type: str = "baselinker"
     default_lang: str = "ua"
 
-    # --- optional lookup tables ------------------------------------------------
-    # Maps Baselinker delivery_method (string) → delivery_service_id
+    # --- optional lookup tables -----------------------------------------------
+    # Maps Baselinker delivery_method string → delivery_service_id
     delivery_service_map: dict[str, int] = field(default_factory=dict)
     # Maps city name (lowercase) → {"city_id": int, "city_mdm_id": str}
     city_map: dict[str, dict] = field(default_factory=dict)
@@ -44,7 +53,6 @@ class MappingConfig:
 
 
 def _resolve_city(config: MappingConfig, city_name: str) -> tuple[int, str]:
-    """Return (city_id, city_mdm_id) for city_name, falling back to defaults."""
     entry = config.city_map.get(city_name.lower())
     if entry:
         return entry["city_id"], entry["city_mdm_id"]
@@ -59,21 +67,24 @@ def _map_merchandises(products: list[dict], config: MappingConfig) -> list[dict]
         qty = int(p.get("quantity") or 1)
         discounted = float(p.get("price_brutto_after_discount") or price)
 
-        item: dict = {
+        merch_fields: dict = {
             "goods_id": p.get("product_id") or p.get("variant_id"),
             "quantity": qty,
             "price": price,
             "cost": round(price * qty, 2),
             "cost_with_discount": round(discounted * qty, 2),
-            "sla_id": config.default_sla_id,
+            "seller_id": config.seller_id,
+            "charge_bonuses": True,
         }
 
+        if p.get("price_brutto"):
+            merch_fields["old_price"] = float(p["price_brutto"])
         if p.get("name"):
-            item["goods_title"] = p["name"]
+            merch_fields["goods_title"] = p["name"]
         if p.get("images") and isinstance(p["images"], list) and p["images"]:
-            item["goods_image"] = p["images"][0]
+            merch_fields["goods_image"] = p["images"][0]
 
-        items.append(item)
+        items.append({"record_type": "0", "fields": merch_fields})
     return items
 
 
@@ -84,10 +95,9 @@ def _map_delivery(order: dict, config: MappingConfig) -> dict:
     delivery_service_id = config.delivery_service_map.get(
         order.get("delivery_method", ""), config.default_delivery_service_id
     )
-
     delivery_cost = float(order.get("delivery_price") or 0)
 
-    delivery: dict = {
+    delivery_fields: dict = {
         "delivery_service_mdm_id": config.default_delivery_service_mdm_id,
         "delivery_service_id": delivery_service_id,
         "delivery_method_id": config.default_delivery_method_id,
@@ -96,34 +106,45 @@ def _map_delivery(order: dict, config: MappingConfig) -> dict:
         "city_id": city_id,
         "city": city_name,
         "city_mdm_id": city_mdm_id,
-        # Baselinker has no structured delivery window; use empty string
-        # so the caller can fill it in if needed
+        # Baselinker has no structured delivery window; caller should override
         "delivery_window": "",
         "recipient_title": order.get("delivery_fullname") or order.get("user_login", ""),
         "recipient_change": 0,
+        "recipient_id": None,
+        # "phone" (not "recipient_phone") per the API contract
+        "phone": order.get("phone"),
+        "place_id": None,
+        "place_number": None,
+        "place_street": None,
+        "place_house": None,
+        "street": None,
+        "street_id": None,
+        "house": None,
+        "flat": None,
+        "street_mdm_id": None,
+        "parcel_locker_id": None,
+        "customs_duty": None,
     }
 
     if order.get("delivery_address"):
-        delivery["street"] = order["delivery_address"]
+        delivery_fields["street"] = order["delivery_address"]
     if order.get("delivery_point_id"):
-        delivery["place_id"] = order["delivery_point_id"]
-        delivery["place_number"] = str(order["delivery_point_id"])
+        delivery_fields["place_id"] = order["delivery_point_id"]
     if order.get("delivery_postcode"):
-        delivery["postal_code"] = order["delivery_postcode"]
-    if order.get("phone"):
-        delivery["recipient_phone"] = order["phone"]
+        delivery_fields["postal_code"] = order["delivery_postcode"]
 
-    return delivery
+    return delivery_fields
 
 
 def map_order(order: dict, config: MappingConfig) -> dict:
     """
     Convert a single Baselinker order dict into an OrderService POST body.
 
-    Fields that cannot be derived from Baselinker data (seller_id,
-    merchant_id, etc.) are taken from MappingConfig.
+    The outer key is "<seller_id>_<bl_order_id>" — this lets the caller
+    correlate OrderService records back to Baselinker without a separate table.
     """
     products: list[dict] = order.get("products", [])
+    bl_order_id = order["order_id"]
 
     amount = sum(
         float(p.get("price_brutto") or 0) * int(p.get("quantity") or 1)
@@ -139,7 +160,7 @@ def map_order(order: dict, config: MappingConfig) -> dict:
     bl_status_id: Optional[int] = order.get("order_status_id")
     os_status = config.status_map.get(bl_status_id, "new") if bl_status_id else "new"
 
-    body: dict = {
+    order_fields: dict = {
         "user_id": config.user_id,
         "user_title": order.get("delivery_fullname") or order.get("user_login", ""),
         "user_phone": order.get("phone", ""),
@@ -155,20 +176,21 @@ def map_order(order: dict, config: MappingConfig) -> dict:
         "distribution_id": config.distribution_id,
         "lang": config.default_lang,
         "status": os_status,
-        "orders_merchandises": _map_merchandises(products, config),
-        "orders_deliveries": [_map_delivery(order, config)],
     }
 
     if order.get("email"):
-        body["email"] = order["email"]
+        order_fields["email"] = order["email"]
     if order.get("user_comments"):
-        body["comment"] = order["user_comments"]
+        order_fields["comment"] = order["user_comments"]
 
-    # Store the Baselinker order_id in orders_external_partner so you can
-    # correlate records without a separate mapping table.
-    body["orders_external_partner"] = {
-        "ext_order_id": str(order["order_id"]),
-        "partner_id": 2,  # id=2 = Prom/external; adjust to your Baselinker partner_id
+    key = f"{config.seller_id}_{bl_order_id}"
+    return {
+        "orders": {
+            key: {
+                "orders": {"fields": order_fields},
+                "orders_deliveries": {"fields": _map_delivery(order, config)},
+                "orders_merchandises": _map_merchandises(products, config),
+                "additional_fields": [],
+            }
+        }
     }
-
-    return body
